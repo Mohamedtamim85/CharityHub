@@ -1,0 +1,350 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  // Pooled connection (e.g. Neon/Supabase pooler) for the running app.
+  url       = env("DATABASE_URL")
+  // Direct, non-pooled connection for migrations (same as DATABASE_URL on a plain Postgres).
+  directUrl = env("DIRECT_URL")
+}
+
+/// Someone who signs in: runs their own hub or works on another owner's team.
+model User {
+  id                String              @id @default(cuid())
+  email             String              @unique
+  passwordHash      String
+  name              String
+  donationHubsOwned DonationHub[]       @relation("DonationHubOwner")
+  donationHubTeams  DonationHubMember[]
+  donorsAdded       Donor[]             @relation("DonorAddedBy")
+  casesValidated    DonationCase[]      @relation("CaseValidatorUser")
+  casesCreated      DonationCase[]      @relation("CaseCreatedBy")
+  donationsRecorded Donation[]          @relation("DonationRecordedBy")
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Donation Hub — validated cases for people in need, donors linked in a
+// trust chain (see src/lib/donation-calc.ts for the layer/grade rules).
+// ---------------------------------------------------------------------------
+
+/// PRIVATE = run individually (owner + team only); PUBLIC = every user can see it.
+enum DonationHubVisibility {
+  PRIVATE
+  PUBLIC
+}
+
+/// One "source": a person or team running their own donation mechanism.
+/// Cases live in a hub, but duplicate checks run across every hub.
+model DonationHub {
+  id          String                @id @default(cuid())
+  name        String
+  description String?
+  visibility  DonationHubVisibility @default(PRIVATE)
+  owner       User                  @relation("DonationHubOwner", fields: [ownerId], references: [id])
+  ownerId     String
+  members     DonationHubMember[]
+  donors      Donor[]
+  cases       DonationCase[]
+  occasions   DonationOccasion[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// The owner's team: users who validate cases first-hand (layer 1).
+model DonationHubMember {
+  hub     DonationHub @relation(fields: [hubId], references: [id], onDelete: Cascade)
+  hubId   String
+  user    User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId  String
+  addedAt DateTime    @default(now())
+
+  @@id([hubId, userId])
+}
+
+/// TEAM = the hub's own people (layer 1). Anyone added below them must be
+/// family or a close friend of whoever brings them in.
+enum DonorRelation {
+  TEAM
+  FAMILY
+  CLOSE_FRIEND
+}
+
+model Donor {
+  id              String        @id @default(cuid())
+  hub             DonationHub   @relation(fields: [hubId], references: [id], onDelete: Cascade)
+  hubId           String
+  name            String
+  mobile          String?
+  email           String?
+  location        String?
+  /// What they intend to give each month (a pledge, not a charge).
+  monthlyAmount   Decimal?      @db.Decimal(14, 2)
+  preferredMethod String?
+  notes           String?
+  relation        DonorRelation
+  /// 1 = hub team, 2 = their family/close friends, n+1 = brought in by a layer-n donor.
+  layer           Int
+  invitedBy       Donor?        @relation("DonorChain", fields: [invitedById], references: [id], onDelete: Restrict)
+  invitedById     String?
+  invitees        Donor[]       @relation("DonorChain")
+  addedBy         User?         @relation("DonorAddedBy", fields: [addedById], references: [id], onDelete: SetNull)
+  addedById       String?
+
+  validatedCases DonationCase[]       @relation("CaseValidatorDonor")
+  visibleCases   CaseVisibleDonor[]
+  donations      Donation[]
+  sponsorships   Sponsorship[]
+  allocations    OccasionAllocation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([hubId])
+  @@index([invitedById])
+  @@index([mobile])
+}
+
+enum DonationCaseStatus {
+  PENDING
+  ACTIVE
+  FUNDED
+  CLOSED
+}
+
+/// CHAIN = every donor in the hub sees it; PRIVATE = only the donors picked.
+enum DonationCaseAudience {
+  CHAIN
+  PRIVATE
+}
+
+enum DonationFundingType {
+  ONE_TIME
+  MONTHLY
+  QUARTERLY
+}
+
+enum DonationCaseCategory {
+  FOOD
+  MEDICAL
+  ORPHAN
+  WIDOW
+  ELDERLY
+  DISABILITY
+  EDUCATION
+  HOUSING
+  DEBT
+  MARRIAGE
+  EMERGENCY
+  OTHER
+}
+
+/// The eight Quran-defined zakat recipients (At-Tawbah 9:60). Null on a case
+/// means it may only receive general sadaqah.
+enum ZakatRecipientCategory {
+  FUQARA
+  MASAKIN
+  AMILIN
+  MUALLAF
+  RIQAB
+  GHARIMIN
+  FI_SABILILLAH
+  IBN_SABIL
+}
+
+model DonationCase {
+  id             String                  @id @default(cuid())
+  hub            DonationHub             @relation(fields: [hubId], references: [id], onDelete: Cascade)
+  hubId          String
+  name           String
+  nationalId     String?
+  mobile         String?
+  /// Digits-only mobile (src/lib/contact-utils.ts mobileKey) for cross-hub duplicate checks.
+  mobileKey      String?
+  governorate    String?
+  city           String?
+  address        String?
+  gender         String?
+  birthYear      Int?
+  maritalStatus  String?
+  familySize     Int?
+  dependents     Int?
+  monthlyIncome  Decimal?                @db.Decimal(14, 2)
+  monthlyNeed    Decimal?                @db.Decimal(14, 2)
+  category       DonationCaseCategory    @default(OTHER)
+  zakatCategory  ZakatRecipientCategory?
+  story          String?
+  /// Bank / wallet / pickup details for handing over support.
+  paymentDetails String?
+  status         DonationCaseStatus      @default(PENDING)
+  audience       DonationCaseAudience    @default(CHAIN)
+  fundingType    DonationFundingType     @default(ONE_TIME)
+  /// ONE_TIME: the total to raise.
+  goalAmount     Decimal?                @db.Decimal(14, 2)
+  /// MONTHLY/QUARTERLY: what the case needs each period.
+  periodAmount   Decimal?                @db.Decimal(14, 2)
+  periodStart    DateTime?               @db.Date
+  periodEnd      DateTime?               @db.Date
+
+  validatedByDonor   Donor?    @relation("CaseValidatorDonor", fields: [validatedByDonorId], references: [id], onDelete: SetNull)
+  validatedByDonorId String?
+  validatedByUser    User?     @relation("CaseValidatorUser", fields: [validatedByUserId], references: [id], onDelete: SetNull)
+  validatedByUserId  String?
+  /// Copied from the validator when validated (1 for the hub team).
+  validationLayer    Int?
+  validatedAt        DateTime?
+  homeVisit          Boolean   @default(false)
+  documentsChecked   Boolean   @default(false)
+  nextReviewDate     DateTime? @db.Date
+
+  createdBy   User?   @relation("CaseCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdById String?
+
+  visibleTo    CaseVisibleDonor[]
+  donations    Donation[]
+  sponsorships Sponsorship[]
+  allocations  OccasionAllocation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([hubId, status])
+  @@index([nationalId])
+  @@index([mobileKey])
+}
+
+model CaseVisibleDonor {
+  case    DonationCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  caseId  String
+  donor   Donor        @relation(fields: [donorId], references: [id], onDelete: Cascade)
+  donorId String
+
+  @@id([caseId, donorId])
+}
+
+enum DonationKind {
+  ZAKAT
+  SADAQAH
+  ZAKAT_AL_FITR
+  UDHIYAH
+  KAFFARAH
+  FIDYAH
+  AQIQAH
+  NADHR
+  WAQF
+  OTHER
+}
+
+enum SponsorshipFrequency {
+  MONTHLY
+  QUARTERLY
+}
+
+/// A donor's standing commitment to a case for a period.
+model Sponsorship {
+  id        String               @id @default(cuid())
+  case      DonationCase         @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  caseId    String
+  donor     Donor                @relation(fields: [donorId], references: [id], onDelete: Cascade)
+  donorId   String
+  amount    Decimal              @db.Decimal(14, 2)
+  frequency SponsorshipFrequency
+  kind      DonationKind         @default(SADAQAH)
+  startDate DateTime             @db.Date
+  endDate   DateTime?            @db.Date
+  active    Boolean              @default(true)
+  notes     String?
+  donations Donation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([caseId])
+  @@index([donorId])
+}
+
+model Donation {
+  id            String       @id @default(cuid())
+  case          DonationCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  caseId        String
+  donor         Donor        @relation(fields: [donorId], references: [id], onDelete: Cascade)
+  donorId       String
+  amount        Decimal      @db.Decimal(14, 2)
+  date          DateTime     @db.Date
+  kind          DonationKind @default(SADAQAH)
+  method        String?
+  reference     String?
+  notes         String?
+  sponsorship   Sponsorship? @relation(fields: [sponsorshipId], references: [id], onDelete: SetNull)
+  sponsorshipId String?
+  /// "2026-10" (monthly) or "2026-Q4" (quarterly) for a sponsorship installment.
+  periodKey     String?
+  recordedBy    User?        @relation("DonationRecordedBy", fields: [recordedById], references: [id], onDelete: SetNull)
+  recordedById  String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([sponsorshipId, periodKey])
+  @@index([caseId])
+  @@index([donorId])
+}
+
+enum DonationOccasionType {
+  ZAKAT_AL_FITR
+  EID_AL_ADHA
+  RAMADAN
+  AQIQAH
+  KAFFARAH
+  FIDYAH
+  WINTER
+  BACK_TO_SCHOOL
+  ASHURA
+  OTHER
+}
+
+/// A seasonal drive (Eid al-Fitr zakat, Eid al-Adha meat, Ramadan boxes, ...).
+model DonationOccasion {
+  id          String               @id @default(cuid())
+  hub         DonationHub          @relation(fields: [hubId], references: [id], onDelete: Cascade)
+  hubId       String
+  type        DonationOccasionType
+  title       String
+  /// Hijri year, e.g. 1448.
+  hijriYear   Int?
+  startDate   DateTime?            @db.Date
+  endDate     DateTime?            @db.Date
+  /// Value of one unit (one person's zakat al-fitr, one meal, one box ...).
+  unitValue   Decimal?             @db.Decimal(14, 2)
+  notes       String?
+  allocations OccasionAllocation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([hubId])
+}
+
+/// What one case receives in an occasion: persons / kg / shares / boxes, and its value.
+model OccasionAllocation {
+  id          String           @id @default(cuid())
+  occasion    DonationOccasion @relation(fields: [occasionId], references: [id], onDelete: Cascade)
+  occasionId  String
+  case        DonationCase     @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  caseId      String
+  donor       Donor?           @relation(fields: [donorId], references: [id], onDelete: SetNull)
+  donorId     String?
+  quantity    Decimal          @db.Decimal(12, 2)
+  amount      Decimal?         @db.Decimal(14, 2)
+  delivered   Boolean          @default(false)
+  deliveredAt DateTime?
+  notes       String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([occasionId, caseId])
+}

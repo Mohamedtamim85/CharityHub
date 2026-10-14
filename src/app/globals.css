@@ -1,0 +1,12 @@
+@import "tailwindcss";
+
+@theme inline {
+  --color-brand: #047857;
+  --color-brand-hover: #065f46;
+}
+
+body {
+  background: #f8fafc;
+  color: #171717;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+}
